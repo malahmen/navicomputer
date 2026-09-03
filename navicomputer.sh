@@ -1,0 +1,392 @@
+#!/usr/bin/env bash
+# -----------------------------------------------------------------------------
+# navicomputer.sh — SSH profile manager (gum-free, flag-driven CLI engine).
+#
+# Manages a set of SSH profiles inside the managed section of ~/.ssh/config
+# (between the BEGIN/END markers). Each profile is a Host alias with its
+# HostName / User / Port / IdentityFile (+ optional extra options). No prompts:
+# everything is driven by flags, so it drops into scripts and a TUI alike.
+#
+# The interactive experience lives in a separate front-end (scomp-link) that
+# drives this engine with flags — the holo-convert / younglings-key pattern.
+#
+# Dependency: jq (always); ssh-keygen (key generation); ssh (test/import); git (use).
+# Run --help for the command list.
+# -----------------------------------------------------------------------------
+
+set -euo pipefail
+
+# ---- gum-free status output (stderr; stdout stays clean for data) -------------
+if [[ -t 2 ]]; then C_G=$'\033[0;32m'; C_Y=$'\033[0;33m'; C_R=$'\033[0;31m'; C_C=$'\033[0;36m'; C_N=$'\033[0m'
+else C_G=""; C_Y=""; C_R=""; C_C=""; C_N=""; fi
+info()    { printf '%s[info]%s  %s\n'  "$C_C" "$C_N" "$*" >&2; }
+success() { printf '%s[ok]%s    %s\n'  "$C_G" "$C_N" "$*" >&2; }
+warn()    { printf '%s[warn]%s  %s\n'  "$C_Y" "$C_N" "$*" >&2; }
+error_exit() { printf '%s[error]%s %s\n' "$C_R" "$C_N" "$*" >&2; exit 1; }
+
+command -v jq &>/dev/null || error_exit "jq is required: brew install jq  /  apt install jq"
+
+SSH_DIR="${SSH_DIR:-$HOME/.ssh}"
+SSH_CONFIG="$SSH_DIR/config"
+MANAGED_TAG="sshger"                       # kept for backward compatibility
+BEGIN_MARK="# === BEGIN ${MANAGED_TAG} ==="
+END_MARK="# === END ${MANAGED_TAG} ==="
+mkdir -p "$SSH_DIR"; chmod 700 "$SSH_DIR" 2>/dev/null || true
+
+# =============================================================================
+# Core — ~/.ssh/config is the single source of truth.
+# =============================================================================
+
+_profiles_flush() {
+    [[ -z "$host" ]] && return
+    local p
+    p=$(jq -n \
+        --arg host "$host" --arg hostname "$hostname" --arg user "$user" \
+        --arg port "$port" --arg key "$key" --arg additional "${addl%$'\n'}" \
+        '{host:$host,hostname:$hostname,user:$user,port:$port,key:$key,additional:$additional}')
+    json=$(printf '%s' "$json" | jq --arg n "$host" --argjson p "$p" '.profiles[$n]=$p')
+    host=""; hostname=""; user=""; port="22"; key=""; addl=""
+}
+
+# Parse the managed section of the config and print profiles as JSON.
+load_profiles() {
+    [[ -f "$SSH_CONFIG" ]] || { printf '{"profiles": {}}\n'; return; }
+    grep -q "^${BEGIN_MARK}\$" "$SSH_CONFIG" || { printf '{"profiles": {}}\n'; return; }
+
+    local json='{"profiles": {}}' host="" hostname="" user="" port="22" key="" addl="" in_managed=0 line
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        case "$line" in
+            "$BEGIN_MARK") in_managed=1; continue ;;
+            "$END_MARK")   _profiles_flush; in_managed=0; continue ;;
+        esac
+        (( in_managed )) || continue
+        [[ "$line" == '# Profile:'* ]] && continue
+        if   [[ "$line" =~ ^Host[[:space:]]+(.+)$                     ]]; then _profiles_flush; host="${BASH_REMATCH[1]}"; hostname="$host"; user=""; port="22"; key=""; addl=""
+        elif [[ "$line" =~ ^[[:space:]]+HostName[[:space:]]+(.+)$     ]]; then hostname="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^[[:space:]]+User[[:space:]]+(.+)$         ]]; then user="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^[[:space:]]+Port[[:space:]]+(.+)$         ]]; then port="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^[[:space:]]+IdentityFile[[:space:]]+(.+)$ ]]; then key="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^[[:space:]] && -n "${line// }"            ]]; then addl+="$line"$'\n'
+        fi
+    done < "$SSH_CONFIG"
+    printf '%s\n' "$json"
+}
+
+# Rewrite only the managed section of the config from a profiles JSON.
+update_ssh_config() {
+    local profiles_json="${1:-$(load_profiles)}" section_tmp tmp
+    section_tmp=$(mktemp)
+    printf '%s\n' "$BEGIN_MARK" > "$section_tmp"
+    while IFS= read -r entry; do
+        local name host hostname user port key additional
+        name=$(jq -r '.key'               <<<"$entry")
+        host=$(jq -r '.value.host'        <<<"$entry")
+        hostname=$(jq -r '.value.hostname'<<<"$entry")
+        user=$(jq -r '.value.user'        <<<"$entry")
+        port=$(jq -r '.value.port'        <<<"$entry")
+        key=$(jq -r '.value.key'          <<<"$entry")
+        additional=$(jq -r '.value.additional // empty' <<<"$entry")
+        printf '# Profile: %s\nHost %s\n    HostName %s\n    User %s\n' "$name" "$host" "$hostname" "$user" >> "$section_tmp"
+        [[ "$port" != "22" ]] && printf '    Port %s\n' "$port" >> "$section_tmp"
+        printf '    IdentityFile %s\n' "$key" >> "$section_tmp"
+        [[ -n "$additional" ]] && printf '%s\n' "$additional" >> "$section_tmp"
+        printf '\n' >> "$section_tmp"
+    done < <(printf '%s' "$profiles_json" | jq -c '.profiles | to_entries[]')
+    printf '%s\n' "$END_MARK" >> "$section_tmp"
+
+    tmp=$(mktemp)
+    if [[ ! -f "$SSH_CONFIG" ]]; then
+        mv "$section_tmp" "$tmp"
+    elif grep -q "^${BEGIN_MARK}\$" "$SSH_CONFIG"; then
+        awk -v sf="$section_tmp" -v b="$BEGIN_MARK" -v e="$END_MARK" '
+            $0==b { while ((getline line < sf) > 0) print line; close(sf); skip=1; next }
+            $0==e { skip=0; next }
+            !skip { print }
+        ' "$SSH_CONFIG" > "$tmp"; rm -f "$section_tmp"
+    else
+        { cat "$SSH_CONFIG"; printf '\n'; cat "$section_tmp"; } > "$tmp"; rm -f "$section_tmp"
+    fi
+    mv "$tmp" "$SSH_CONFIG"; chmod 600 "$SSH_CONFIG"
+}
+save_profiles() { update_ssh_config "$1"; }
+
+_profile_exists() { load_profiles | jq -e --arg n "$1" '.profiles[$n] != null' >/dev/null; }
+
+# Any Host alias already present anywhere in the config (managed or not)?
+_host_in_config() {
+    [[ -f "$SSH_CONFIG" ]] || return 1
+    awk '/^Host / { for(i=2;i<=NF;i++) print $i }' "$SSH_CONFIG" | grep -qx "$1"
+}
+
+# Remove a Host block outside the managed section.
+_remove_unmanaged_host() {
+    local host_alias="$1" tmp; tmp=$(mktemp)
+    awk -v host="$host_alias" -v b="$BEGIN_MARK" -v e="$END_MARK" '
+        $0==b { in_managed=1; print; next }
+        $0==e { in_managed=0; print; next }
+        in_managed { print; next }
+        /^Host / { if ($2==host) { skip=1; next } else { skip=0; print; next } }
+        !skip { print }
+    ' "$SSH_CONFIG" > "$tmp"
+    mv "$tmp" "$SSH_CONFIG"; chmod 600 "$SSH_CONFIG"
+}
+
+# =============================================================================
+# Commands
+# =============================================================================
+
+nc_list() {
+    local as_json=0; [[ "${1:-}" == "--json" ]] && as_json=1
+    local profiles; profiles=$(load_profiles)
+    if (( as_json )); then printf '%s\n' "$profiles"; return; fi
+    if [[ "$(jq '.profiles | length' <<<"$profiles")" -eq 0 ]]; then info "No profiles configured yet."; return; fi
+    jq -r '.profiles | to_entries[] |
+        "  \(.key)\n    Host: \(.value.host)  User: \(.value.user)  Port: \(.value.port)\n    Key:  \(.value.key)"' <<<"$profiles"
+}
+
+nc_view() {
+    local name="" as_json=0
+    while [[ $# -gt 0 ]]; do case "$1" in
+        --name) name="$2"; shift 2 ;; --json) as_json=1; shift ;; *) error_exit "view: unknown arg $1" ;;
+    esac; done
+    [[ -n "$name" ]] || error_exit "view: --name is required"
+    _profile_exists "$name" || error_exit "No such profile: $name"
+    local profile; profile=$(load_profiles | jq --arg n "$name" '.profiles[$n]')
+    if (( as_json )); then printf '%s\n' "$profile"; return; fi
+    printf 'Profile:  %s\nHost:     %s\nHostName: %s\nUser:     %s\nPort:     %s\nIdentity: %s\n' \
+        "$name" "$(jq -r .host <<<"$profile")" "$(jq -r .hostname <<<"$profile")" \
+        "$(jq -r .user <<<"$profile")" "$(jq -r .port <<<"$profile")" "$(jq -r .key <<<"$profile")"
+    local additional; additional=$(jq -r '.additional // empty' <<<"$profile")
+    [[ -n "$additional" ]] && { printf 'Options:\n'; sed 's/^/  /' <<<"$additional"; }
+}
+
+nc_add() {
+    # --name is the Host alias (what you type after `ssh`); it is the profile's
+    # identity and the key everything is stored/looked-up by.
+    local name="" hostname="" user="" port="22" key="" additional="" gen_key="" key_comment=""
+    while [[ $# -gt 0 ]]; do case "$1" in
+        --name|--host) name="$2"; shift 2 ;;
+        --hostname) hostname="$2"; shift 2 ;; --user) user="$2"; shift 2 ;;
+        --port) port="$2"; shift 2 ;;         --key) key="$2"; shift 2 ;;
+        --additional) additional="$2"; shift 2 ;;
+        --gen-key) gen_key="$2"; shift 2 ;;   --key-comment) key_comment="$2"; shift 2 ;;
+        *) error_exit "add: unknown arg $1" ;;
+    esac; done
+    [[ -n "$name" ]] || error_exit "add: --name is required"
+    local host="$name"
+    _profile_exists "$name" && error_exit "Profile '$name' already exists (use 'edit')."
+    _host_in_config "$host" && error_exit "Host alias '$host' already exists in ${SSH_CONFIG}."
+
+    [[ -z "$hostname" ]] && hostname="$host"
+    # Split a pasted 'user@host' in the hostname field.
+    if [[ "$hostname" == *@* ]]; then
+        [[ -z "$user" ]] && user="${hostname%%@*}"; hostname="${hostname#*@}"
+        info "Split 'user@host' → User='${user}', HostName='${hostname}'."
+    fi
+    [[ -z "$user" ]] && user="git"
+    [[ -z "$port" ]] && port="22"
+
+    if [[ -n "$gen_key" ]]; then
+        command -v ssh-keygen &>/dev/null || error_exit "ssh-keygen not found."
+        [[ -z "$key_comment" ]] && key_comment="${user}@${host}"
+        case "$gen_key" in
+            ed25519)  key="$SSH_DIR/id_${name}_ed25519"; ssh-keygen -t ed25519 -f "$key" -C "$key_comment" -N "" >&2 ;;
+            rsa|rsa-4096) key="$SSH_DIR/id_${name}_rsa"; ssh-keygen -t rsa -b 4096 -f "$key" -C "$key_comment" -N "" >&2 ;;
+            *) error_exit "add: --gen-key must be ed25519 or rsa" ;;
+        esac
+        chmod 600 "$key"; success "Key generated: $key"
+    fi
+    [[ -n "$key" ]] || error_exit "add: provide --key <path> or --gen-key <type>"
+
+    local profiles profile_json
+    profiles=$(load_profiles)
+    profile_json=$(jq -n --arg host "$host" --arg hostname "$hostname" --arg user "$user" \
+        --arg port "$port" --arg key "$key" --arg additional "$additional" \
+        '{host:$host,hostname:$hostname,user:$user,port:$port,key:$key,additional:$additional}')
+    save_profiles "$(jq --arg n "$name" --argjson p "$profile_json" '.profiles[$n]=$p' <<<"$profiles")"
+    success "Profile '$name' added."
+    [[ -f "${key}.pub" ]] && printf '%s\n' "${key}.pub"   # stdout: pubkey path for the caller
+}
+
+nc_edit() {
+    # The alias (--name) can't be changed here — rename = remove + add. Only the
+    # profile's fields are editable; unspecified ones keep their current value.
+    local name="" set_hostname=0 set_user=0 set_port=0 set_key=0 set_additional=0
+    local host="" hostname="" user="" port="" key="" additional=""
+    while [[ $# -gt 0 ]]; do case "$1" in
+        --name) name="$2"; shift 2 ;;
+        --hostname) hostname="$2"; set_hostname=1; shift 2 ;;
+        --user) user="$2"; set_user=1; shift 2 ;;            --port) port="$2"; set_port=1; shift 2 ;;
+        --key) key="$2"; set_key=1; shift 2 ;;               --additional) additional="$2"; set_additional=1; shift 2 ;;
+        *) error_exit "edit: unknown arg $1" ;;
+    esac; done
+    [[ -n "$name" ]] || error_exit "edit: --name is required"
+    _profile_exists "$name" || error_exit "No such profile: $name"
+    local cur; cur=$(load_profiles | jq --arg n "$name" '.profiles[$n]')
+    host="$name"
+    (( set_hostname ))   || hostname=$(jq -r .hostname <<<"$cur")
+    (( set_user ))       || user=$(jq -r .user <<<"$cur")
+    (( set_port ))       || port=$(jq -r .port <<<"$cur")
+    (( set_key ))        || key=$(jq -r .key <<<"$cur")
+    (( set_additional )) || additional=$(jq -r '.additional // empty' <<<"$cur")
+    local updated; updated=$(jq -n --arg host "$host" --arg hostname "$hostname" --arg user "$user" \
+        --arg port "$port" --arg key "$key" --arg additional "$additional" \
+        '{host:$host,hostname:$hostname,user:$user,port:$port,key:$key,additional:$additional}')
+    save_profiles "$(load_profiles | jq --arg n "$name" --argjson p "$updated" '.profiles[$n]=$p')"
+    success "Profile '$name' updated."
+}
+
+nc_remove() {
+    local name="" delete_keys=0
+    while [[ $# -gt 0 ]]; do case "$1" in
+        --name) name="$2"; shift 2 ;; --delete-keys) delete_keys=1; shift ;; *) error_exit "remove: unknown arg $1" ;;
+    esac; done
+    [[ -n "$name" ]] || error_exit "remove: --name is required"
+    _profile_exists "$name" || error_exit "No such profile: $name"
+    local key_path; key_path=$(load_profiles | jq -r --arg n "$name" '.profiles[$n].key')
+    if (( delete_keys )) && [[ -f "$key_path" ]]; then
+        rm -f "$key_path" "${key_path}.pub"; success "Key files deleted: $key_path"
+    fi
+    save_profiles "$(load_profiles | jq --arg n "$name" 'del(.profiles[$n])')"
+    success "Profile '$name' removed."
+}
+
+nc_use() {
+    local name="" repo="" remote="" git_name="" git_email="" do_init=0
+    while [[ $# -gt 0 ]]; do case "$1" in
+        --name) name="$2"; shift 2 ;;      --repo) repo="$2"; shift 2 ;;
+        --remote) remote="$2"; shift 2 ;;  --git-name) git_name="$2"; shift 2 ;;
+        --git-email) git_email="$2"; shift 2 ;; --init) do_init=1; shift ;;
+        *) error_exit "use: unknown arg $1" ;;
+    esac; done
+    [[ -n "$name" ]] || error_exit "use: --name is required"
+    [[ -n "$repo" ]] || error_exit "use: --repo is required"
+    _profile_exists "$name" || error_exit "No such profile: $name"
+    command -v git &>/dev/null || error_exit "git not found."
+    repo="${repo/#\~/$HOME}"
+    [[ -d "$repo" ]] || error_exit "Directory not found: $repo"
+    if ! git -C "$repo" rev-parse --git-dir &>/dev/null; then
+        (( do_init )) || error_exit "Not a git repository: $repo (pass --init to create one)."
+        git -C "$repo" init >&2
+    fi
+    local key_path; key_path=$(load_profiles | jq -r --arg n "$name" '.profiles[$n].key')
+    if [[ -n "$remote" ]] && ! git -C "$repo" config --get remote.origin.url &>/dev/null; then
+        git -C "$repo" remote add origin "$remote"; info "origin → $remote"
+    fi
+    git -C "$repo" config core.sshCommand "ssh -i ${key_path} -o IdentitiesOnly=yes"
+    [[ -n "$git_name" ]]  && git -C "$repo" config user.name  "$git_name"
+    [[ -n "$git_email" ]] && git -C "$repo" config user.email "$git_email"
+    success "Profile '$name' wired to: $repo"
+    info "sshCommand: $(git -C "$repo" config core.sshCommand)"
+}
+
+# Print aliases (one per line) for the given scope on stdout.
+nc_hosts()     { [[ -f "$SSH_CONFIG" ]] && awk '/^Host / && $2 !~ /[*?]/ { print $2 }' "$SSH_CONFIG" || true; }
+nc_unmanaged() {
+    [[ -f "$SSH_CONFIG" ]] || return 0
+    awk -v b="$BEGIN_MARK" -v e="$END_MARK" '
+        $0==b{skip=1;next} $0==e{skip=0;next}
+        !skip && /^Host / && $2 !~ /[*?]/ { print $2 }' "$SSH_CONFIG"
+}
+
+_test_one() {
+    local alias="$1" effective target output result exit_code=0
+    effective=$(ssh -G "$alias" 2>/dev/null | awk '/^hostname / {print $2; exit}')
+    if printf '%s' "$effective" | grep -qiE "(github\.com|gitlab\.com|bitbucket\.org)$"; then target="git@${alias}"; else target="$alias"; fi
+    info "Testing '$alias' → ${target} ..."
+    output=$(ssh -T -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "$target" </dev/null 2>&1) || exit_code=$?
+    if grep -qiE 'permission denied|publickey.*(denied|failed)|could not be loaded|host key verification failed|no such identity' <<<"$output"; then result="fail"
+    elif [[ $exit_code -eq 0 ]] || grep -qiE 'authenticated|welcome|hello|shell access (is )?not (supported|allowed)|does not provide shell|logged in as' <<<"$output"; then result="ok"
+    else result="fail"; fi
+    if [[ "$result" == "ok" ]]; then success "[$alias] OK${output:+  ($output)}"; else warn "[$alias] Failed (exit ${exit_code})${output:+  — $output}"; return 1; fi
+}
+
+nc_test() {
+    command -v ssh &>/dev/null || error_exit "ssh not found."
+    local all=0 names=()
+    while [[ $# -gt 0 ]]; do case "$1" in
+        --all) all=1; shift ;; --name) names+=("$2"); shift 2 ;; *) error_exit "test: unknown arg $1" ;;
+    esac; done
+    if (( all )); then while IFS= read -r h; do [[ -n "$h" ]] && names+=("$h"); done < <(nc_hosts); fi
+    (( ${#names[@]} )) || error_exit "test: pass --name <alias> (repeatable) or --all"
+    local rc=0 n; for n in "${names[@]}"; do _test_one "$n" || rc=1; done; return $rc
+}
+
+nc_import() {
+    command -v ssh &>/dev/null || error_exit "ssh not found."
+    local all=0 remove_orig=0 names=()
+    while [[ $# -gt 0 ]]; do case "$1" in
+        --all) all=1; shift ;; --host) names+=("$2"); shift 2 ;;
+        --remove-original) remove_orig=1; shift ;; *) error_exit "import: unknown arg $1" ;;
+    esac; done
+    if (( all )); then while IFS= read -r h; do [[ -n "$h" ]] && names+=("$h"); done < <(nc_unmanaged); fi
+    (( ${#names[@]} )) || error_exit "import: pass --host <alias> (repeatable) or --all"
+
+    local profiles imported=0 alias; profiles=$(load_profiles)
+    for alias in "${names[@]}"; do
+        local g hostname user port identity
+        g=$(ssh -G "$alias" 2>/dev/null)
+        hostname=$(awk '/^hostname / {print $2}' <<<"$g")
+        user=$(awk '/^user / {print $2}' <<<"$g")
+        port=$(awk '/^port / {print $2}' <<<"$g")
+        identity=$(awk '/^identityfile /{print $2; exit}' <<<"$g"); identity="${identity/#\~/$HOME}"
+        local pj; pj=$(jq -n --arg host "$alias" --arg hostname "${hostname:-$alias}" \
+            --arg user "${user:-$(whoami)}" --arg port "${port:-22}" --arg key "$identity" --arg additional "" \
+            '{host:$host,hostname:$hostname,user:$user,port:$port,key:$key,additional:$additional}')
+        profiles=$(jq --arg n "$alias" --argjson p "$pj" '.profiles[$n]=$p' <<<"$profiles")
+        success "Imported: $alias → ${user:-?}@${hostname:-?}:${port:-22}"; imported=$((imported+1))
+    done
+    (( imported )) || return 0
+    save_profiles "$profiles"; info "$imported profile(s) now managed."
+    if (( remove_orig )); then for alias in "${names[@]}"; do _remove_unmanaged_host "$alias"; info "Unmanaged entry removed: $alias"; done; fi
+}
+
+# =============================================================================
+usage() {
+    cat >&2 <<'EOF'
+navicomputer — SSH profile manager (CLI)
+
+USAGE
+  navicomputer.sh <command> [flags]
+
+COMMANDS
+  list [--json]                                  list managed profiles
+  view --name ALIAS [--json]                     show one profile
+  add  --name ALIAS [--hostname H] [--user U] [--port P]
+       (--key PATH | --gen-key ed25519|rsa) [--key-comment C] [--additional STR]
+  edit --name ALIAS [--hostname|--user|--port|--key|--additional VALUE]...
+  remove --name ALIAS [--delete-keys]
+
+  --name is the SSH Host alias (what you type after `ssh`) and the profile's
+  identity; to rename, remove and re-add.
+  use  --name N --repo DIR [--remote URL] [--init] [--git-name X] [--git-email Y]
+  test (--name ALIAS ... | --all)                verify SSH auth
+  import (--host ALIAS ... | --all) [--remove-original]   adopt unmanaged hosts
+  hosts                                          list all Host aliases (helper)
+  unmanaged                                      list unmanaged Host aliases (helper)
+  --help
+
+Profiles live in the '=== BEGIN sshger ===' managed section of ~/.ssh/config
+(the marker is kept for backward compatibility with the former sshger tool).
+EOF
+}
+
+main() {
+    local cmd="${1:-}"; [[ $# -gt 0 ]] && shift || true
+    case "$cmd" in
+        list)      nc_list "$@" ;;
+        view)      nc_view "$@" ;;
+        add)       nc_add "$@" ;;
+        edit)      nc_edit "$@" ;;
+        remove)    nc_remove "$@" ;;
+        use)       nc_use "$@" ;;
+        test)      nc_test "$@" ;;
+        import)    nc_import "$@" ;;
+        hosts)     nc_hosts ;;
+        unmanaged) nc_unmanaged ;;
+        ""|-h|--help) usage ;;
+        *) usage; error_exit "unknown command: $cmd" ;;
+    esac
+}
+
+main "$@"
