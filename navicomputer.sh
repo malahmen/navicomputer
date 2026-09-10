@@ -344,17 +344,50 @@ nc_test() {
     local rc=0 n; for n in "${names[@]}"; do _test_one "$n" || rc=1; done; return $rc
 }
 
+# Print what `import` does not carry over from ALIAS's unmanaged block, one item
+# per line: extra aliases on its Host line and every option other than
+# HostName / User / Port / the first IdentityFile.
+_unmanaged_extras() {
+    [[ -f "$SSH_CONFIG" ]] || return 0
+    awk -v host="$1" -v b="$BEGIN_MARK" -v e="$END_MARK" '
+        $0==b { managed=1; next } $0==e { managed=0; next } managed { next }
+        tolower($1) ~ /^(host|match)$/ {
+            inblk=0; idf=0; extra=""
+            if (tolower($1)=="host") for (i=2;i<=NF;i++) { if ($i==host) inblk=1; else extra=extra " " $i }
+            if (inblk && extra!="") print "Host aliases:" extra
+            next
+        }
+        !inblk || /^[[:space:]]*(#|$)/ { next }
+        { split($1, kv, "="); k=tolower(kv[1]) }
+        k=="hostname" || k=="user" || k=="port" { next }
+        k=="identityfile" && !idf++ { next }
+        { sub(/^[[:space:]]+/, ""); print }
+    ' "$SSH_CONFIG"
+}
+
 nc_import() {
     command -v ssh &>/dev/null || error_exit "ssh not found."
-    local all=0 remove_orig=0 names=()
+    local all=0 remove_orig=0 force=0 names=()
     while [[ $# -gt 0 ]]; do case "$1" in
         --all) all=1; shift ;; --host) names+=("$2"); shift 2 ;;
-        --remove-original) remove_orig=1; shift ;; *) error_exit "import: unknown arg $1" ;;
+        --remove-original) remove_orig=1; shift ;; --force) force=1; shift ;;
+        *) error_exit "import: unknown arg $1" ;;
     esac; done
     if (( all )); then while IFS= read -r h; do [[ -n "$h" ]] && names+=("$h"); done < <(nc_unmanaged); fi
     (( ${#names[@]} )) || error_exit "import: pass --host <alias> (repeatable) or --all"
 
-    local profiles imported=0 alias; profiles=$(load_profiles)
+    # Only HostName/User/Port/first IdentityFile are carried over. Never delete an
+    # original that still holds anything else unless the caller says --force.
+    local alias extras blocked=""
+    for alias in "${names[@]}"; do
+        extras=$(_unmanaged_extras "$alias"); [[ -n "$extras" ]] || continue
+        if (( remove_orig && ! force )); then blocked+="  ${alias}:"$'\n'"$(sed 's/^/    /' <<<"$extras")"$'\n'
+        elif (( remove_orig )); then warn "Not imported from '$alias' (deleted with --remove-original --force):"$'\n'"$(sed 's/^/          /' <<<"$extras")"
+        else warn "Not imported from '$alias' (left in the unmanaged entry):"$'\n'"$(sed 's/^/          /' <<<"$extras")"; fi
+    done
+    [[ -z "$blocked" ]] || error_exit "import: --remove-original would delete settings that are not carried over:"$'\n'"${blocked%$'\n'}"$'\n'"Re-run with --force to delete them anyway, or without --remove-original to keep the originals."
+
+    local profiles imported=0; profiles=$(load_profiles)
     for alias in "${names[@]}"; do
         local g hostname user port identity
         g=$(ssh -G "$alias" 2>/dev/null)
@@ -393,7 +426,9 @@ COMMANDS
   identity; to rename, remove and re-add.
   use  --name N --repo DIR [--remote URL] [--init] [--git-name X] [--git-email Y]
   test (--name ALIAS ... | --all)                verify SSH auth
-  import (--host ALIAS ... | --all) [--remove-original]   adopt unmanaged hosts
+  import (--host ALIAS ... | --all) [--remove-original [--force]]   adopt unmanaged hosts
+       (carries HostName/User/Port/first IdentityFile; anything else is reported and
+        kept in the original, which --remove-original refuses to delete without --force)
   hosts                                          list all Host aliases (helper)
   unmanaged                                      list unmanaged Host aliases (helper)
   --help
