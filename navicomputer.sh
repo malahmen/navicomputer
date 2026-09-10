@@ -74,8 +74,35 @@ load_profiles() {
     printf '%s\n' "$json"
 }
 
+# Refuse to rewrite a config whose managed-section markers do not pair up: the
+# section replace would otherwise swallow everything below a lone BEGIN.
+_check_markers() {
+    [[ -f "$SSH_CONFIG" ]] || return 0
+    local nb ne
+    nb=$(grep -c "^${BEGIN_MARK}\$" "$SSH_CONFIG") || true
+    ne=$(grep -c "^${END_MARK}\$" "$SSH_CONFIG") || true
+    (( nb == ne && nb <= 1 )) || error_exit "Managed-section markers in ${SSH_CONFIG} are inconsistent (BEGIN: ${nb}, END: ${ne}); fix the file by hand before continuing."
+}
+
+# Copy the config to config.<timestamp>.bak (mode 600) before every rewrite and
+# keep only the newest $BACKUP_KEEP copies.
+BACKUP_KEEP="${BACKUP_KEEP:-5}"
+_backup_config() {
+    [[ -f "$SSH_CONFIG" ]] || return 0
+    local base bak n=0 baks
+    base="${SSH_CONFIG}.$(date +%Y%m%dT%H%M%S)"; bak="${base}.bak"
+    while [[ -e "$bak" ]]; do n=$((n+1)); bak="${base}_${n}.bak"; done
+    cp "$SSH_CONFIG" "$bak"; chmod 600 "$bak"
+    baks=("${SSH_CONFIG}".[0-9]*.bak)                 # name order == time order
+    while (( ${#baks[@]} > BACKUP_KEEP )); do rm -f "${baks[0]}"; baks=("${baks[@]:1}"); done
+}
+
+# Atomically replace the config with $1 (same filesystem, mode 600).
+_install_config() { chmod 600 "$1"; mv -f "$1" "$SSH_CONFIG"; }
+
 # Rewrite only the managed section of the config from a profiles JSON.
 update_ssh_config() {
+    _check_markers
     local profiles_json="${1:-$(load_profiles)}" section_tmp tmp
     section_tmp=$(mktemp)
     printf '%s\n' "$BEGIN_MARK" > "$section_tmp"
@@ -97,7 +124,8 @@ update_ssh_config() {
     done < <(printf '%s' "$profiles_json" | jq -c '.profiles | to_entries[]')
     printf '%s\n' "$END_MARK" >> "$section_tmp"
 
-    tmp=$(mktemp)
+    _backup_config
+    tmp=$(mktemp "$SSH_DIR/.config.XXXXXX")
     if [[ ! -f "$SSH_CONFIG" ]]; then
         mv "$section_tmp" "$tmp"
     elif grep -q "^${BEGIN_MARK}\$" "$SSH_CONFIG"; then
@@ -109,7 +137,7 @@ update_ssh_config() {
     else
         { cat "$SSH_CONFIG"; printf '\n'; cat "$section_tmp"; } > "$tmp"; rm -f "$section_tmp"
     fi
-    mv "$tmp" "$SSH_CONFIG"; chmod 600 "$SSH_CONFIG"
+    _install_config "$tmp"
 }
 save_profiles() { update_ssh_config "$1"; }
 
@@ -123,7 +151,8 @@ _host_in_config() {
 
 # Remove a Host block outside the managed section.
 _remove_unmanaged_host() {
-    local host_alias="$1" tmp; tmp=$(mktemp)
+    _check_markers; _backup_config
+    local host_alias="$1" tmp; tmp=$(mktemp "$SSH_DIR/.config.XXXXXX")
     awk -v host="$host_alias" -v b="$BEGIN_MARK" -v e="$END_MARK" '
         $0==b { in_managed=1; print; next }
         $0==e { in_managed=0; print; next }
@@ -131,7 +160,7 @@ _remove_unmanaged_host() {
         /^Host / { if ($2==host) { skip=1; next } else { skip=0; print; next } }
         !skip { print }
     ' "$SSH_CONFIG" > "$tmp"
-    mv "$tmp" "$SSH_CONFIG"; chmod 600 "$SSH_CONFIG"
+    _install_config "$tmp"
 }
 
 # =============================================================================
