@@ -61,12 +61,14 @@ load_profiles() {
         esac
         (( in_managed )) || continue
         [[ "$line" == '# Profile:'* ]] && continue
+        # Option lines are accepted at column 0 too (hand edits, older --additional
+        # values); they are re-indented on the next rewrite.
         if   [[ "$line" =~ ^Host[[:space:]]+(.+)$                     ]]; then _profiles_flush; host="${BASH_REMATCH[1]}"; hostname="$host"; user=""; port="22"; key=""; addl=""
-        elif [[ "$line" =~ ^[[:space:]]+HostName[[:space:]]+(.+)$     ]]; then hostname="${BASH_REMATCH[1]}"
-        elif [[ "$line" =~ ^[[:space:]]+User[[:space:]]+(.+)$         ]]; then user="${BASH_REMATCH[1]}"
-        elif [[ "$line" =~ ^[[:space:]]+Port[[:space:]]+(.+)$         ]]; then port="${BASH_REMATCH[1]}"
-        elif [[ "$line" =~ ^[[:space:]]+IdentityFile[[:space:]]+(.+)$ ]]; then key="${BASH_REMATCH[1]}"
-        elif [[ "$line" =~ ^[[:space:]] && -n "${line// }"            ]]; then addl+="$line"$'\n'
+        elif [[ "$line" =~ ^[[:space:]]*HostName[[:space:]]+(.+)$     ]]; then hostname="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^[[:space:]]*User[[:space:]]+(.+)$         ]]; then user="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^[[:space:]]*Port[[:space:]]+(.+)$         ]]; then port="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^[[:space:]]*IdentityFile[[:space:]]+(.+)$ ]]; then key="${BASH_REMATCH[1]}"
+        elif [[ -n "${line//[[:space:]]/}" && -n "$host"              ]]; then addl+="${line#"${line%%[![:space:]]*}"}"$'\n'
         fi
     done < "$SSH_CONFIG"
     printf '%s\n' "$json"
@@ -89,7 +91,8 @@ update_ssh_config() {
         printf '# Profile: %s\nHost %s\n    HostName %s\n    User %s\n' "$name" "$host" "$hostname" "$user" >> "$section_tmp"
         [[ "$port" != "22" ]] && printf '    Port %s\n' "$port" >> "$section_tmp"
         printf '    IdentityFile %s\n' "$key" >> "$section_tmp"
-        [[ -n "$additional" ]] && printf '%s\n' "$additional" >> "$section_tmp"
+        # Extra lines are always written indented so load_profiles keeps them.
+        [[ -n "$additional" ]] && printf '%s\n' "$additional" | sed -e '/^[[:space:]]*$/d' -e 's/^[[:space:]]*/    /' >> "$section_tmp"
         printf '\n' >> "$section_tmp"
     done < <(printf '%s' "$profiles_json" | jq -c '.profiles | to_entries[]')
     printf '%s\n' "$END_MARK" >> "$section_tmp"
