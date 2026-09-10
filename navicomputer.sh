@@ -112,6 +112,9 @@ save_profiles() { update_ssh_config "$1"; }
 
 _profile_exists() { load_profiles | jq -e --arg n "$1" '.profiles[$n] != null' >/dev/null; }
 
+# _check_port CMD PORT — a port must be an integer in 1..65535.
+_check_port() { [[ "$2" =~ ^[0-9]+$ ]] && (( $2 >= 1 && $2 <= 65535 )) || error_exit "$1: --port must be a number between 1 and 65535 (got '$2')"; }
+
 # Any Host alias already present anywhere in the config (managed or not)?
 _host_in_config() {
     [[ -f "$SSH_CONFIG" ]] || return 1
@@ -173,6 +176,8 @@ nc_add() {
         *) error_exit "add: unknown arg $1" ;;
     esac; done
     [[ -n "$name" ]] || error_exit "add: --name is required"
+    # The alias becomes a single `Host` pattern: whitespace would split it into several.
+    [[ "$name" != *[[:space:]]* ]] || error_exit "add: --name must not contain whitespace (got '$name')"
     local host="$name"
     _profile_exists "$name" && error_exit "Profile '$name' already exists (use 'edit')."
     _host_in_config "$host" && error_exit "Host alias '$host' already exists in ${SSH_CONFIG}."
@@ -185,16 +190,20 @@ nc_add() {
     fi
     [[ -z "$user" ]] && user="git"
     [[ -z "$port" ]] && port="22"
+    _check_port "add" "$port"
 
     if [[ -n "$gen_key" ]]; then
         command -v ssh-keygen &>/dev/null || error_exit "ssh-keygen not found."
         [[ -z "$key_comment" ]] && key_comment="${user}@${host}"
+        local keygen_args
         case "$gen_key" in
-            ed25519)  key="$SSH_DIR/id_${name}_ed25519"; ssh-keygen -t ed25519 -f "$key" -C "$key_comment" -N "" >&2 ;;
-            rsa|rsa-4096) key="$SSH_DIR/id_${name}_rsa"; ssh-keygen -t rsa -b 4096 -f "$key" -C "$key_comment" -N "" >&2 ;;
-            *) error_exit "add: --gen-key must be ed25519 or rsa" ;;
+            ed25519)      key="$SSH_DIR/id_${name}_ed25519"; keygen_args=(-t ed25519) ;;
+            rsa|rsa-4096) key="$SSH_DIR/id_${name}_rsa";     keygen_args=(-t rsa -b 4096) ;;
+            *) error_exit "add: --gen-key must be ed25519, rsa or rsa-4096" ;;
         esac
-        chmod 600 "$key"; success "Key generated: $key"
+        # No prompts: an existing key is reused instead of letting ssh-keygen ask to overwrite.
+        if [[ -e "$key" ]]; then info "Key already exists, reusing: $key"
+        else ssh-keygen "${keygen_args[@]}" -f "$key" -C "$key_comment" -N "" >&2; chmod 600 "$key"; success "Key generated: $key"; fi
     fi
     [[ -n "$key" ]] || error_exit "add: provide --key <path> or --gen-key <type>"
 
@@ -227,6 +236,7 @@ nc_edit() {
     (( set_hostname ))   || hostname=$(jq -r .hostname <<<"$cur")
     (( set_user ))       || user=$(jq -r .user <<<"$cur")
     (( set_port ))       || port=$(jq -r .port <<<"$cur")
+    _check_port "edit" "$port"
     (( set_key ))        || key=$(jq -r .key <<<"$cur")
     (( set_additional )) || additional=$(jq -r '.additional // empty' <<<"$cur")
     local updated; updated=$(jq -n --arg host "$host" --arg hostname "$hostname" --arg user "$user" \
@@ -353,7 +363,8 @@ COMMANDS
   list [--json]                                  list managed profiles
   view --name ALIAS [--json]                     show one profile
   add  --name ALIAS [--hostname H] [--user U] [--port P]
-       (--key PATH | --gen-key ed25519|rsa) [--key-comment C] [--additional STR]
+       (--key PATH | --gen-key ed25519|rsa|rsa-4096) [--key-comment C] [--additional STR]
+       (--gen-key reuses ~/.ssh/id_<ALIAS>_<type> when it already exists)
   edit --name ALIAS [--hostname|--user|--port|--key|--additional VALUE]...
   remove --name ALIAS [--delete-keys]
 
