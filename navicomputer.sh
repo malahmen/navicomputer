@@ -206,7 +206,9 @@ nc_view() {
         "$name" "$(jq -r .host <<<"$profile")" "$(jq -r .hostname <<<"$profile")" \
         "$(jq -r .user <<<"$profile")" "$(jq -r .port <<<"$profile")" "$(jq -r .key <<<"$profile")"
     local additional; additional=$(jq -r '.additional // empty' <<<"$profile")
-    [[ -n "$additional" ]] && { printf 'Options:\n'; sed 's/^/  /' <<<"$additional"; }
+    # Same trailing-conditional trap: a profile with no extra options must not
+    # make `view` exit 1.
+    if [[ -n "$additional" ]]; then printf 'Options:\n'; sed 's/^/  /' <<<"$additional"; fi
 }
 
 nc_add() {
@@ -260,7 +262,13 @@ nc_add() {
         '{host:$host,hostname:$hostname,user:$user,port:$port,key:$key,additional:$additional}')
     save_profiles "$(jq --arg n "$name" --argjson p "$profile_json" '.profiles[$n]=$p' <<<"$profiles")"
     success "Profile '$name' added."
-    [[ -f "${key}.pub" ]] && printf '%s\n' "${key}.pub"   # stdout: pubkey path for the caller
+    # if/else, not `[[ ... ]] && printf`: as the function's last statement a false
+    # test would make `add` return 1 under `set -e` right after reporting success.
+    if [[ -f "${key}.pub" ]]; then
+        printf '%s\n' "${key}.pub"                        # stdout: pubkey path for the caller
+    else
+        info "No public key at ${key}.pub — nothing to hand to a git host yet."
+    fi
 }
 
 nc_edit() {
