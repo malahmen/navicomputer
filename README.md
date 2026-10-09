@@ -160,4 +160,4 @@ outside-the-managed-section) — used by the front-end's pickers.
 
 ## License
 
-Released under the [Unlicense](LICENSE).
+[MIT](LICENSE) © 2026 malahmen.
