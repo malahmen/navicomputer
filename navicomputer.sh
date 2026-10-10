@@ -92,9 +92,17 @@ _backup_config() {
     [[ -f "$SSH_CONFIG" ]] || return 0
     local base bak n=0 baks
     base="${SSH_CONFIG}.$(date +%Y%m%dT%H%M%S)"; bak="${base}.bak"
-    while [[ -e "$bak" ]]; do n=$((n+1)); bak="${base}_${n}.bak"; done
+    # Zero-padded, so _02 still sorts before _10.
+    while [[ -e "$bak" ]]; do n=$((n+1)); bak=$(printf '%s_%02d.bak' "$base" "$n"); done
     cp "$SSH_CONFIG" "$bak"; chmod 600 "$bak"
-    baks=("${SSH_CONFIG}".[0-9]*.bak)                 # name order == time order
+
+    # Sorted explicitly under C collation rather than trusting the glob: the
+    # default locale collation ignores punctuation, so it ordered
+    # config.<ts>_01.bak BEFORE config.<ts>.bak and the prune below deleted the
+    # NEWER backup of two written in the same second. Under LC_ALL=C '.' sorts
+    # before '_' and name order is time order again, which is the property this
+    # whole scheme rests on.
+    mapfile -t baks < <(printf '%s\n' "${SSH_CONFIG}".[0-9]*.bak | LC_ALL=C sort)
     while (( ${#baks[@]} > BACKUP_KEEP )); do rm -f "${baks[0]}"; baks=("${baks[@]:1}"); done
 }
 
@@ -163,18 +171,37 @@ _check_port() { [[ "$2" =~ ^[0-9]+$ ]] && (( $2 >= 1 && $2 <= 65535 )) || error_
 # Any Host alias already present anywhere in the config (managed or not)?
 _host_in_config() {
     [[ -f "$SSH_CONFIG" ]] || return 1
-    awk '/^Host / { for(i=2;i<=NF;i++) print $i }' "$SSH_CONFIG" | grep -qx "$1"
+    awk 'tolower($1)=="host" { for(i=2;i<=NF;i++) print $i }' "$SSH_CONFIG" | grep -qx "$1"
 }
 
 # Remove a Host block outside the managed section.
 _remove_unmanaged_host() {
     _check_markers; _backup_config
     local host_alias="$1" tmp; tmp=$(mktemp "$SSH_DIR/.config.XXXXXX")
+    # The skip has to END on anything that starts a new section, not just on
+    # the next `Host`. ssh_config(5) has three: Host, Match and Include. With
+    # only Host handled, removing an entry also deleted a Match block that
+    # happened to follow it — silently, and in the file that gates every ssh
+    # session on this machine.
+    #
+    # Matched on the first field case-insensitively rather than with /^Host /,
+    # because ssh does not care about case and a tab after the keyword is legal.
+    #
+    # Any field may name the host, not just $2: _unmanaged_extras already
+    # matches that way, so with $2 alone a `Host prod foo` block reported extra
+    # aliases, was gated behind --force, and then was not removed at all while
+    # the caller printed "Unmanaged entry removed".
     awk -v host="$host_alias" -v b="$BEGIN_MARK" -v e="$END_MARK" '
         $0==b { in_managed=1; print; next }
         $0==e { in_managed=0; print; next }
         in_managed { print; next }
-        /^Host / { if ($2==host) { skip=1; next } else { skip=0; print; next } }
+        tolower($1)=="host" {
+            skip=0
+            for (i=2; i<=NF; i++) if ($i==host) skip=1
+            if (skip) next
+            print; next
+        }
+        tolower($1)=="match" || tolower($1)=="include" { skip=0; print; next }
         !skip { print }
     ' "$SSH_CONFIG" > "$tmp"
     _install_config "$tmp"
@@ -337,7 +364,9 @@ nc_use() {
     if [[ -n "$remote" ]] && ! git -C "$repo" config --get remote.origin.url &>/dev/null; then
         git -C "$repo" remote add origin "$remote"; info "origin → $remote"
     fi
-    git -C "$repo" config core.sshCommand "ssh -i ${key_path} -o IdentitiesOnly=yes"
+    # %q: a key path containing a space produced an sshCommand that git split
+    # into the wrong arguments.
+    git -C "$repo" config core.sshCommand "$(printf 'ssh -i %q -o IdentitiesOnly=yes' "$key_path")"
     [[ -n "$git_name" ]]  && git -C "$repo" config user.name  "$git_name"
     [[ -n "$git_email" ]] && git -C "$repo" config user.email "$git_email"
     success "Profile '$name' wired to: $repo"
@@ -345,17 +374,22 @@ nc_use() {
 }
 
 # Print aliases (one per line) for the given scope on stdout.
-nc_hosts()     { [[ -f "$SSH_CONFIG" ]] && awk '/^Host / && $2 !~ /[*?]/ { print $2 }' "$SSH_CONFIG" || true; }
+# $2 only, not every field: a block's first alias is its canonical name, and
+# `import` makes one profile per block. Extra aliases are reported instead, by
+# _unmanaged_extras.
+nc_hosts()     { [[ -f "$SSH_CONFIG" ]] && awk 'tolower($1)=="host" && $2 !~ /[*?]/ { print $2 }' "$SSH_CONFIG" || true; }
 nc_unmanaged() {
     [[ -f "$SSH_CONFIG" ]] || return 0
     awk -v b="$BEGIN_MARK" -v e="$END_MARK" '
         $0==b{skip=1;next} $0==e{skip=0;next}
-        !skip && /^Host / && $2 !~ /[*?]/ { print $2 }' "$SSH_CONFIG"
+        !skip && tolower($1)=="host" && $2 !~ /[*?]/ { print $2 }' "$SSH_CONFIG"
 }
 
 _test_one() {
     local alias="$1" effective target output result exit_code=0
-    effective=$(ssh -G "$alias" 2>/dev/null | awk '/^hostname / {print $2; exit}')
+    # -F, so this resolves against the config navicomputer manages rather than
+    # whatever ssh would pick up by default. Without it $SSH_DIR was ignored.
+    effective=$(ssh -F "$SSH_CONFIG" -G "$alias" 2>/dev/null | awk '/^hostname / {print $2; exit}')
     if printf '%s' "$effective" | grep -qiE "(github\.com|gitlab\.com|bitbucket\.org)$"; then target="git@${alias}"; else target="$alias"; fi
     info "Testing '$alias' → ${target} ..."
     output=$(ssh -T -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "$target" </dev/null 2>&1) || exit_code=$?
@@ -376,6 +410,44 @@ nc_test() {
     local rc=0 n; for n in "${names[@]}"; do _test_one "$n" || rc=1; done; return $rc
 }
 
+# _unmanaged_identityfile <alias> — the IdentityFile the unmanaged block sets
+# for <alias>, or nothing when it sets none.
+#
+# `ssh -G` cannot answer this: with no IdentityFile configured it prints the
+# whole DEFAULT list, headed by ~/.ssh/id_rsa. Importing that first entry and
+# adding `IdentitiesOnly yes` told ssh to offer one key that very likely does
+# not exist, and to offer nothing else — so every host imported without an
+# explicit key stopped authenticating for anyone whose key is ed25519.
+_unmanaged_identityfile() {
+    [[ -f "$SSH_CONFIG" ]] || return 0
+    awk -v host="$1" -v b="$BEGIN_MARK" -v e="$END_MARK" '
+        $0==b { managed=1; next } $0==e { managed=0; next } managed { next }
+        tolower($1) ~ /^(host|match|include)$/ {
+            inblk=0
+            if (tolower($1)=="host") for (i=2; i<=NF; i++) if ($i==host) inblk=1
+            next
+        }
+        !inblk { next }
+        # ssh accepts `IdentityFile /p`, `IdentityFile=/p`, `IdentityFile = /p`
+        # and a double-quoted path, which is the only way to write one with a
+        # space in it. Splitting on whitespace alone silently truncated the
+        # last two -- and a truncated key path fails at the next push, not here.
+        {
+            line=$0
+            sub(/^[[:space:]]+/, "", line)
+            kw=line; sub(/[[:space:]=].*$/, "", kw)
+            val=substr(line, length(kw)+1)
+            sub(/^[[:space:]]*=?[[:space:]]*/, "", val)
+            sub(/[[:space:]]+$/, "", val)
+        }
+        tolower(kw)=="identityfile" && val!="" {
+            if (substr(val,1,1)=="\"") { sub(/^"/, "", val); sub(/".*$/, "", val) }
+            else sub(/[[:space:]].*$/, "", val)
+            if (val!="") { print val; exit }
+        }
+    ' "$SSH_CONFIG"
+}
+
 # Print what `import` does not carry over from ALIAS's unmanaged block, one item
 # per line: extra aliases on its Host line and every option other than
 # HostName / User / Port / the first IdentityFile.
@@ -383,7 +455,11 @@ _unmanaged_extras() {
     [[ -f "$SSH_CONFIG" ]] || return 0
     awk -v host="$1" -v b="$BEGIN_MARK" -v e="$END_MARK" '
         $0==b { managed=1; next } $0==e { managed=0; next } managed { next }
-        tolower($1) ~ /^(host|match)$/ {
+        # Include ends the block here too: ssh splices another file in at that
+        # point, so lines after it no longer reliably belong to this host --
+        # the same reason _remove_unmanaged_host stops deleting there.
+        # (No apostrophes: this comment lives inside a single-quoted program.)
+        tolower($1) ~ /^(host|match|include)$/ {
             inblk=0; idf=0; extra=""
             if (tolower($1)=="host") for (i=2;i<=NF;i++) { if ($i==host) inblk=1; else extra=extra " " $i }
             if (inblk && extra!="") print "Host aliases:" extra
@@ -422,11 +498,18 @@ nc_import() {
     local profiles imported=0; profiles=$(load_profiles)
     for alias in "${names[@]}"; do
         local g hostname user port identity
-        g=$(ssh -G "$alias" 2>/dev/null)
+        # -F for the same reason, and it matters more here: without it import
+        # read a different file from the one it was about to delete from, so it
+        # could store the wrong hostname and user and then remove the original.
+        g=$(ssh -F "$SSH_CONFIG" -G "$alias" 2>/dev/null)
         hostname=$(awk '/^hostname / {print $2}' <<<"$g")
         user=$(awk '/^user / {print $2}' <<<"$g")
         port=$(awk '/^port / {print $2}' <<<"$g")
-        identity=$(awk '/^identityfile /{print $2; exit}' <<<"$g"); identity="${identity/#\~/$HOME}"
+        # From the original block, NOT from `ssh -G` — see
+        # _unmanaged_identityfile. An empty value means the block set no key,
+        # and update_ssh_config then writes neither IdentityFile nor
+        # IdentitiesOnly, leaving ssh to its own defaults as before the import.
+        identity=$(_unmanaged_identityfile "$alias"); identity="${identity/#\~/$HOME}"
         local pj; pj=$(jq -n --arg host "$alias" --arg hostname "${hostname:-$alias}" \
             --arg user "${user:-$(whoami)}" --arg port "${port:-22}" --arg key "$identity" --arg additional "" \
             '{host:$host,hostname:$hostname,user:$user,port:$port,key:$key,additional:$additional}')

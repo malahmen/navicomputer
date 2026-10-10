@@ -1,0 +1,44 @@
+name: ci
+
+# Every push and pull request. The suites need no network, no tokens and no
+# services: they drive the engine against a temporary $SSH_DIR, which is also
+# what makes them safe to run anywhere.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Versions
+        # Printed because a suite that behaves differently on the runner than
+        # on a workstation is the thing hardest to debug from a log alone --
+        # and because the import suite resolves hosts with `ssh -G`, so its
+        # answers depend on which OpenSSH is installed here.
+        run: |
+          bash --version | head -1
+          git --version
+          jq --version
+          ssh -V
+          shellcheck --version | sed -n 2p
+
+      - name: shellcheck
+        # -S warning explicitly: SC2002 is off by default in shellcheck 0.11+
+        # but on in older releases, so the severity floor has to be pinned or
+        # the runner disagrees with the workstation.
+        #
+        # Globbed, not listed: a named list quietly stops covering the next
+        # test file somebody adds.
+        run: |
+          shellcheck -S warning navicomputer.sh tests/*.sh
+
+      - name: tests
+        run: tests/run-all.sh
