@@ -110,12 +110,22 @@ automatically unless you set `IdentitiesOnly` here yourself.
 
 ### Importing hand-written hosts
 
-`import` resolves each alias with `ssh -G` and carries over exactly four things:
-`HostName`, `User`, `Port` and the **first** `IdentityFile` (as ssh sees them,
-so defaults from a `Host *` block are folded in). Everything else is **not**
-imported — additional aliases on the same `Host` line, further `IdentityFile`s,
-and any other option (`ForwardAgent`, `ProxyJump`, …). Whatever is left out is
-listed in a warning.
+`import` carries over exactly four things: `HostName`, `User`, `Port` and the
+**first** `IdentityFile`. Everything else is **not** imported — additional
+aliases on the same `Host` line, further `IdentityFile`s, and any other option
+(`ForwardAgent`, `ProxyJump`, …). Whatever is left out is listed in a warning.
+
+The first three are read with `ssh -G`, so defaults from a `Host *` block are
+folded in. The `IdentityFile` is read from the **host's own block** instead,
+and a host whose block sets none is imported with no key at all. `ssh -G`
+cannot answer that question: asked about a host with no `IdentityFile`, it
+replies with the whole built-in default list, headed by `~/.ssh/id_rsa`.
+Importing that first entry — and writing `IdentitiesOnly yes` beside it — would
+pin ssh to a key that probably does not exist and forbid every other, so a host
+that worked before the import would stop authenticating.
+
+Both lookups are resolved against the file navicomputer manages (`ssh -G -F`),
+not against ssh's default path, so `SSH_DIR` is honoured.
 
 - Without `--remove-original` the original entry stays in place, so those
   settings keep working; you just end up with the alias defined twice, and for
@@ -126,8 +136,35 @@ listed in a warning.
   touched, with the list of what would be lost. Add `--force` to delete the
   block anyway, or re-add the missing options with `edit --additional`.
 
+  The block being deleted runs from its `Host` line to the next `Host`, `Match`
+  or `Include` — all three, since `ssh_config` lets any of them end a block.
+  The alias is matched against **every** name on the `Host` line, so
+  `Host prod web` is removed whether you import `prod` or `web`. The keyword
+  itself is matched the way ssh reads it: any capitalisation, and a tab after
+  it is fine.
+
 Helper commands `hosts` and `unmanaged` print the config's Host aliases (all /
 outside-the-managed-section) — used by the front-end's pickers.
+
+## Tests
+
+```sh
+tests/run-all.sh            # every suite
+bash tests/test-import.sh   # or one of them
+```
+
+No network, no credentials, no services. Each suite points `SSH_DIR` at a
+temporary directory and **refuses to start** if that path is under `$HOME`,
+because the file under test is the one that gates every ssh session on the
+machine. `NAVICOMPUTER=/path/to/navicomputer.sh` runs them against another
+copy, which is how a fix is checked for actually fixing something.
+
+| Suite | Covers |
+| ----- | ------ |
+| `test-profiles.sh` | the `add`/`list`/`view`/`edit`/`remove` round trip, every refusal, and where the managed section is placed |
+| `test-import.sh` | what `import` carries over, and which file it reads to find out |
+| `test-remove-unmanaged.sh` | `--remove-original`: what is deleted, and everything that has to survive it |
+| `test-use.sh` | `core.sshCommand` — asserted on the argument vector a shell would split it into, not on the string |
 
 ## Options reference
 
@@ -156,7 +193,9 @@ outside-the-managed-section) — used by the front-end's pickers.
 - `--name` must not contain whitespace and `--port` must be a number in
   `1..65535`; both are rejected with a clear error.
 - Never elevates privileges; only reads/writes under `~/.ssh` (the config, its
-  `.bak` copies, and generated keys).
+  `.bak` copies, and generated keys). `SSH_DIR=<dir>` moves all of that
+  somewhere else — the suites use it, and it is how you can try a change
+  against a throwaway config.
 
 ## License
 
