@@ -134,6 +134,7 @@ printf '%s\nHost x\n' "$BEGIN_MARK" > "$CONFIG"
 run add --name any --hostname any.example --key "$SSH_DIR/id_a"
 check "add refuses, exit 1"     test "$RC" -eq 1
 check "and says to fix by hand" in_err 'by hand'
-check "the file is unchanged"   bash -c 'test "$(wc -l < "$1")" = 2' _ "$CONFIG"
+# Arithmetic, not a string: BSD wc pads the count with spaces (Kamino item 125).
+check "the file is unchanged"   bash -c 'test "$(( $(wc -l < "$1") ))" = 2' _ "$CONFIG"
 
 nc_report "profiles"

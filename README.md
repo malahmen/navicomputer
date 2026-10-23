@@ -36,9 +36,17 @@ is left as is. A few rules keep that rewrite safe:
 - **`IdentitiesOnly yes`.** Every profile with a key is written with
   `IdentitiesOnly yes`, so ssh offers only that key regardless of what a
   `Host *` adds. Set it yourself in `--additional` to override the value.
-- **Backups.** Before every rewrite the whole file is copied to
-  `~/.ssh/config.<YYYYmmddTHHMMSS>.bak` (mode 600). The five newest backups are
-  kept; set `BACKUP_KEEP=<n>` to change that.
+- **Backups.** Before a command's first rewrite the whole file is copied to
+  `~/.ssh/config.<YYYYmmddTHHMMSS>.bak` (mode 600) - once per command, so the
+  backup is the file as it was before it, however many hosts an `import`
+  removes. The five newest backups are kept; set `BACKUP_KEEP=<n>` to change
+  that.
+- **A symlinked config** (stow, chezmoi, home-manager) is written through: the
+  file the link points to is updated, and the link stays.
+- **Quoting.** A key path with a space is written double-quoted, the only form
+  ssh accepts for it.
+- **Windows line endings** (CRLF) are refused before anything is written:
+  convert the file first.
 - **Marker check.** If the markers are inconsistent (a `BEGIN` without an `END`,
   or several of either) the tool refuses to touch the file and asks you to fix
   it by hand — a lone `BEGIN` would otherwise swallow everything below it.
@@ -115,9 +123,13 @@ automatically unless you set `IdentitiesOnly` here yourself.
 aliases on the same `Host` line, further `IdentityFile`s, and any other option
 (`ForwardAgent`, `ProxyJump`, …). Whatever is left out is listed in a warning.
 
-The first three are read with `ssh -G`, so defaults from a `Host *` block are
-folded in. The `IdentityFile` is read from the **host's own block** instead,
-and a host whose block sets none is imported with no key at all. `ssh -G`
+`HostName` is read with `ssh -G`. `User`, `Port` and the `IdentityFile` are
+read from the **host's own block** instead: a block that sets no `User` is
+imported with none, so ssh keeps applying your defaults (a `Host *` block, or
+the login name) rather than having them frozen into the profile. A host whose
+block sets no key is imported with no key at all. An `Include` inside a host's
+block belongs to that block: it is reported as not carried over, and with
+`--remove-original --force` it goes with the block. `ssh -G`
 cannot answer that question: asked about a host with no `IdentityFile`, it
 replies with the whole built-in default list, headed by `~/.ssh/id_rsa`.
 Importing that first entry — and writing `IdentitiesOnly yes` beside it — would

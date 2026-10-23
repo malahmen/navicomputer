@@ -71,7 +71,8 @@ in_unmanaged()  { unmanaged_only | grep -qE "$1"; }
 no_unmanaged()  { ! unmanaged_only | grep -qE "$1"; }
 in_err()        { grep -qE -- "$1" <<<"$ERR"; }
 no_line()       { ! grep -qxF "$1" "$2"; }
-mode_is()       { [[ "$(stat -c %a "$2")" == "$1" ]]; }
+# GNU stat first, then BSD (macOS), which has no -c (Kamino item 125).
+mode_is()       { [[ "$(stat -c %a "$2" 2>/dev/null || stat -f %Lp "$2")" == "$1" ]]; }
 
 # profile_is <alias> <jq-path> <value> — read back through the engine, not by
 # grepping the file, so the parse half of the round trip is covered too.
