@@ -94,7 +94,7 @@ a profile, `remove` it and `add` it again.
 ./navicomputer.sh list [--json]                 # list profiles
 ./navicomputer.sh view --name github-work       # show one (add --json for JSON)
 ./navicomputer.sh edit --name box --user root   # change fields (keeps the rest)
-./navicomputer.sh remove --name box [--delete-keys]
+./navicomputer.sh remove --name box [--delete-keys [--force]]
 
 # Wire a profile to a git repo (sets core.sshCommand to use its key)
 ./navicomputer.sh use --name github-work --repo ~/code/proj \
@@ -114,6 +114,21 @@ a 4096-bit RSA key). The key is written to `~/.ssh/id_<alias>_ed25519` or
 `~/.ssh/id_<alias>_rsa` with no passphrase, and its `.pub` path is printed on
 stdout. If that file already exists it is **reused** (with an info message)
 rather than regenerated — nothing ever prompts to overwrite.
+
+### Deleting keys (`remove --delete-keys`)
+
+A deleted private key is not in any backup, so `--delete-keys` is narrow:
+
+- It **never** deletes a key that anything else still uses - another profile,
+  any `IdentityFile` in the config or in a file it `Include`s (compared as
+  files, so a symlink counts), or one of ssh's default identities
+  (`~/.ssh/id_rsa`, `id_ed25519`, …, which ssh offers to every host that names
+  no key). `--force` does not change that.
+- Otherwise it deletes only the key `--gen-key` made for that profile,
+  `~/.ssh/id_<alias>_ed25519` or `_rsa`. Any other path needs `--force`.
+- A refusal changes nothing - the profile stays too; re-run without
+  `--delete-keys` to remove it and keep the key. When it does delete, it names
+  both paths (the key and its `.pub`), after the config has been rewritten.
 
 ### Extra options (`--additional`)
 
@@ -184,6 +199,7 @@ copy, which is how a fix is checked for actually fixing something.
 | `test-import.sh` | what `import` carries over, and which file it reads to find out |
 | `test-remove-unmanaged.sh` | `--remove-original`: what is deleted, and everything that has to survive it |
 | `test-use.sh` | `core.sshCommand` — asserted on the argument vector a shell would split it into, not on the string |
+| `test-delete-keys.sh` | `remove --delete-keys`: never a key anything else uses, only generated ones without `--force` (item 177) |
 | `test-field-validation.sh` | a value ssh cannot read is refused with the config and its backups untouched (item 181) |
 
 ## Options reference
@@ -198,12 +214,13 @@ copy, which is how a fix is checked for actually fixing something.
 | `--gen-key ed25519\|rsa\|rsa-4096` | add | generate a new key at `~/.ssh/id_<name>_<type>` (reused if it exists) |
 | `--key-comment C` | add | comment for the generated key (default `user@alias`) |
 | `--additional STR` | add, edit | extra `~/.ssh/config` lines for this Host (newline-separated, indentation optional) |
-| `--delete-keys` | remove | also delete the profile's key files |
+| `--delete-keys` | remove | also delete the profile's key files (see *Deleting keys*) |
 | `--repo DIR` `--remote URL` `--init` `--git-name` `--git-email` | use | git wiring |
 | `--all` | test, import | act on every host |
 | `--host ALIAS` | import | a specific host to import (repeatable) |
 | `--remove-original` | import | delete the original unmanaged entry after importing (refused if settings would be lost) |
 | `--force` | import | with `--remove-original`: delete the original even if settings are lost |
+| `--force` | remove | with `--delete-keys`: delete a key navicomputer did not generate (never one still in use) |
 | `--json` | list, view | machine-readable output |
 
 ## Notes

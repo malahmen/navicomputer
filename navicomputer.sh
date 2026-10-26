@@ -434,19 +434,97 @@ nc_edit() {
     success "Profile '$name' updated."
 }
 
+# _config_files - the config and every file it Includes (recursively, globs
+# expanded; a relative path is relative to $SSH_DIR, as ssh reads it for a
+# user config), one path per line.
+_config_files() {
+    [[ -f "$SSH_CONFIG" ]] || return 0
+    local queue=("$SSH_CONFIG") seen=" " f pat m i=0
+    while (( i < ${#queue[@]} && i < 256 )); do
+        f="${queue[i]}"; i=$((i + 1))
+        [[ "$seen" == *" $f "* ]] && continue
+        seen+="$f "; printf '%s\n' "$f"
+        while IFS= read -r pat; do
+            pat="${pat#\"}"; pat="${pat%\"}"; pat="${pat/#\~/$HOME}"
+            [[ "$pat" == /* ]] || pat="$SSH_DIR/$pat"
+            while IFS= read -r m; do if [[ -f "$m" ]]; then queue+=("$m"); fi; done < <(compgen -G "$pat" || true)
+        done < <(awk 'tolower($1)=="include" { for (i=2; i<=NF; i++) print $i }' "$f")
+    done
+}
+
+# _identityfile_refs NAME - every IdentityFile in the config and the files it
+# Includes, except in profile NAME's own block, as "<file>:<line>\t<path>"
+# with ~ and %d expanded.
+_identityfile_refs() {
+    local f
+    while IFS= read -r f; do
+        awk -v skip="$1" -v b="$BEGIN_MARK" -v e="$END_MARK" -v home="$HOME" -v file="$f" '
+            $0==b { managed=1; mine=0; next } $0==e { managed=0; mine=0; next }
+            managed && $1=="Host" { mine=($2==skip); next }
+            managed && mine { next }
+            {
+                line=$0; sub(/^[[:space:]]+/, "", line)
+                kw=line; sub(/[[:space:]=].*$/, "", kw)
+                if (tolower(kw)!="identityfile") next
+                val=substr(line, length(kw)+1)
+                sub(/^[[:space:]]*=?[[:space:]]*/, "", val); sub(/[[:space:]]+$/, "", val)
+                if (substr(val,1,1)=="\"") { sub(/^"/, "", val); sub(/".*$/, "", val) }
+                if (substr(val,1,1)=="~") val=home substr(val,2)
+                gsub(/%d/, home, val)
+                if (val!="") print file ":" NR "\t" val
+            }' "$f"
+    done < <(_config_files)
+}
+
+# _same_file A B - the same path, or two names for the same file.
+_same_file() { [[ "$1" == "$2" ]] || [[ -e "$1" && -e "$2" && "$1" -ef "$2" ]]; }
+
+# _check_key_deletable NAME KEY FORCE - refuse (exit 1) to delete KEY when
+# anything else still uses it. `remove --delete-keys` deleted whatever key the
+# profile named: two profiles on ~/.ssh/id_ed25519, remove one with
+# --delete-keys, and the main private key was gone, with no backup, while the
+# other profile still pointed at it (Kamino item 177).
+_check_key_deletable() {
+    local name="$1" key="$2" force="$3" users="" ref d dir
+    while IFS=$'\t' read -r ref d; do
+        if _same_file "$d" "$key"; then users+="    IdentityFile at ${ref}"$'\n'; fi
+    done < <(_identityfile_refs "$name")
+    # ssh offers these to every host that names no IdentityFile.
+    for dir in "$HOME/.ssh" "$SSH_DIR"; do
+        for d in id_rsa id_ecdsa id_ecdsa_sk id_ed25519 id_ed25519_sk id_xmss id_dsa; do
+            if _same_file "$dir/$d" "$key"; then users+="    ssh's default identity ${dir}/${d}"$'\n'; break 2; fi
+        done
+    done
+    if [[ -n "$users" ]]; then
+        error_exit "remove: not deleting ${key}: it is still in use by"$'\n'"${users%$'\n'}"$'\n'"Nothing was changed. Re-run without --delete-keys to remove the profile and keep the key."
+    fi
+    # Only what `add --gen-key` made for this very profile, unless --force.
+    if (( ! force )) && ! _same_file "$key" "$SSH_DIR/id_${name}_ed25519" && ! _same_file "$key" "$SSH_DIR/id_${name}_rsa"; then
+        error_exit "remove: not deleting ${key}: navicomputer did not generate it for '${name}' (its keys are ${SSH_DIR}/id_${name}_ed25519 or _rsa). Nothing was changed. Pass --force to delete it anyway, or re-run without --delete-keys."
+    fi
+}
+
 nc_remove() {
-    local name="" delete_keys=0
+    local name="" delete_keys=0 force=0
     while [[ $# -gt 0 ]]; do case "$1" in
-        --name) name="$2"; shift 2 ;; --delete-keys) delete_keys=1; shift ;; *) error_exit "remove: unknown arg $1" ;;
+        --name) name="$2"; shift 2 ;; --delete-keys) delete_keys=1; shift ;; --force) force=1; shift ;;
+        *) error_exit "remove: unknown arg $1" ;;
     esac; done
     [[ -n "$name" ]] || error_exit "remove: --name is required"
     _profile_exists "$name" || error_exit "No such profile: $name"
-    local key_path; key_path=$(load_profiles | jq -r --arg n "$name" '.profiles[$n].key')
-    if (( delete_keys )) && [[ -f "$key_path" ]]; then
-        rm -f "$key_path" "${key_path}.pub"; success "Key files deleted: $key_path"
+    local key_path files=() f; key_path=$(load_profiles | jq -r --arg n "$name" '.profiles[$n].key')
+    if (( delete_keys )); then
+        if [[ -n "$key_path" ]]; then for f in "$key_path" "${key_path}.pub"; do if [[ -f "$f" ]]; then files+=("$f"); fi; done; fi
+        if (( ${#files[@]} )); then _check_key_deletable "$name" "$key_path" "$force"
+        else info "No key files at '${key_path}'; nothing to delete."; fi
     fi
+    # The config first: if the rewrite is refused, the keys are still there.
     save_profiles "$(load_profiles | jq --arg n "$name" 'del(.profiles[$n])')"
     success "Profile '$name' removed."
+    if (( ${#files[@]} )); then
+        info "Deleting key files: ${files[*]}"
+        rm -f -- "${files[@]}"; success "Key files deleted: ${files[*]}"
+    fi
 }
 
 nc_use() {
@@ -664,7 +742,9 @@ COMMANDS
        (--key PATH | --gen-key ed25519|rsa|rsa-4096) [--key-comment C] [--additional STR]
        (--gen-key reuses ~/.ssh/id_<ALIAS>_<type> when it already exists)
   edit --name ALIAS [--hostname|--user|--port|--key|--additional VALUE]...
-  remove --name ALIAS [--delete-keys]
+  remove --name ALIAS [--delete-keys [--force]]
+       (--delete-keys deletes only ~/.ssh/id_<ALIAS>_<type>, and never a key another
+        IdentityFile or ssh's defaults still use; --force lifts only the first rule)
 
   --name is the SSH Host alias (what you type after `ssh`) and the profile's
   identity; to rename, remove and re-add.
