@@ -135,6 +135,36 @@ _config_tmp() { mktemp "$(dirname "$(_config_real)")/.config.XXXXXX"; }
 # Atomically replace the config with $1 (same filesystem, mode 600).
 _install_config() { chmod 600 "$1"; mv -f "$1" "$(_config_real)"; }
 
+# _validate_config FILE [ALIAS...] - refuse a rewritten config ssh cannot read.
+# One bad value (a HostName with a space, an unknown option in --additional)
+# makes ssh reject the WHOLE file, every host on the machine, while
+# navicomputer exited 0 (Kamino item 181). So the new file is read by ssh
+# itself, `ssh -G` once per alias, before anything is installed or backed up;
+# on failure FILE is deleted and the command stops.
+_validate_config() {
+    local file="$1"; shift
+    command -v ssh &>/dev/null || { warn "ssh not found: the rewritten ${SSH_CONFIG} was not checked."; return 0; }
+    (( $# )) || set -- navicomputer-check
+    local a out was=""
+    for a in "$@"; do
+        out=$(ssh -F "$file" -G -- "$a" 2>&1 >/dev/null) && continue
+        rm -f "$file"
+        if [[ -f "$SSH_CONFIG" ]] && ! ssh -F "$SSH_CONFIG" -G -- "$a" >/dev/null 2>&1; then
+            was=$'\n'"ssh already fails on the current ${SSH_CONFIG}; fix that by hand first."
+        fi
+        error_exit "ssh cannot read the config this change would write (checked as ${a}); nothing was changed:"$'\n'"${out//"$file"/<new config>}${was}"
+    done
+}
+
+# _commit_config FILE [ALIAS...] - validate, back up, install. In that order:
+# a refused rewrite leaves both the config and its backups as they were.
+_commit_config() {
+    local file="$1"; shift
+    _validate_config "$file" "$@"
+    _backup_config
+    _install_config "$file"
+}
+
 # A value written into ssh_config: double-quoted when it holds whitespace, the
 # only form ssh accepts for one. Written bare, a key path with a space made
 # ssh refuse the WHOLE file - every host - while navicomputer exited 0
@@ -145,6 +175,7 @@ _cfg_value() { if [[ "$1" =~ [[:space:]] && "$1" != \"*\" ]]; then printf '"%s"'
 update_ssh_config() {
     _check_markers
     local profiles_json="${1:-$(load_profiles)}" section_tmp tmp
+    tmp=$(_config_tmp)
     section_tmp=$(mktemp)
     printf '%s\n' "$BEGIN_MARK" > "$section_tmp"
     while IFS= read -r entry; do
@@ -172,8 +203,6 @@ update_ssh_config() {
     done < <(printf '%s' "$profiles_json" | jq -c '.profiles | to_entries[]')
     printf '%s\n' "$END_MARK" >> "$section_tmp"
 
-    _backup_config
-    tmp=$(_config_tmp)
     if [[ ! -f "$SSH_CONFIG" ]]; then
         mv "$section_tmp" "$tmp"
     elif grep -q "^${BEGIN_MARK}\$" "$SSH_CONFIG"; then
@@ -194,7 +223,9 @@ update_ssh_config() {
             END { if (!done) { print ""; while ((getline line < sf) > 0) print line; close(sf) } }
         ' "$SSH_CONFIG" > "$tmp"; rm -f "$section_tmp"
     fi
-    _install_config "$tmp"
+    local aliases=()
+    mapfile -t aliases < <(printf '%s' "$profiles_json" | jq -r '.profiles | keys[]')
+    _commit_config "$tmp" ${aliases[@]+"${aliases[@]}"}
 }
 save_profiles() { update_ssh_config "$1"; }
 
@@ -202,6 +233,21 @@ _profile_exists() { load_profiles | jq -e --arg n "$1" '.profiles[$n] != null' >
 
 # _check_port CMD PORT — a port must be an integer in 1..65535.
 _check_port() { [[ "$2" =~ ^[0-9]+$ ]] && (( $2 >= 1 && $2 <= 65535 )) || error_exit "$1: --port must be a number between 1 and 65535 (got '$2')"; }
+
+# _check_fields CMD HOSTNAME USER KEY ADDITIONAL - values that would break the
+# file for every host, refused before anything is written (Kamino item 181).
+# ssh takes HostName and User as one word each: `HostName evil host` is a
+# parse error for the whole config. A newline in the key path would end the
+# line, and a Host or Match line in --additional would start a new block that
+# the following options - and the next profile's - would then belong to.
+_check_fields() {
+    [[ "$2" != *[[:space:]]* ]] || error_exit "$1: --hostname must not contain whitespace (got '$2')"
+    [[ "$3" != *[[:space:]]* ]] || error_exit "$1: --user must not contain whitespace (got '$3')"
+    [[ "$4" != *$'\n'* ]]      || error_exit "$1: --key must not contain a newline"
+    if grep -qiE '^[[:space:]]*(host|match)([[:space:]=]|$)' <<<"$5"; then
+        error_exit "$1: --additional must not contain a Host or Match line (it would start a new block)"
+    fi
+}
 
 # Any Host alias already present anywhere in the config (managed or not)?
 _host_in_config() {
@@ -211,7 +257,7 @@ _host_in_config() {
 
 # Remove a Host block outside the managed section.
 _remove_unmanaged_host() {
-    _check_markers; _backup_config
+    _check_markers
     local host_alias="$1" tmp; tmp=$(_config_tmp)
     # The skip ENDS on what starts a new block: the next Host or Match (and
     # the managed section's markers). With only Host handled, removing an
@@ -247,7 +293,7 @@ _remove_unmanaged_host() {
         tolower($1)=="match" { skip=0; print; next }
         !skip { print }
     ' "$SSH_CONFIG" > "$tmp"
-    _install_config "$tmp"
+    _commit_config "$tmp" "$host_alias"
 }
 
 # _sh_quote STRING - STRING as one POSIX shell word: bare when it holds only
@@ -325,6 +371,7 @@ nc_add() {
     [[ -z "$user" ]] && user="git"
     [[ -z "$port" ]] && port="22"
     _check_port "add" "$port"
+    _check_fields "add" "$hostname" "$user" "$key" "$additional"
 
     if [[ -n "$gen_key" ]]; then
         command -v ssh-keygen &>/dev/null || error_exit "ssh-keygen not found."
@@ -379,6 +426,7 @@ nc_edit() {
     _check_port "edit" "$port"
     (( set_key ))        || key=$(jq -r .key <<<"$cur")
     (( set_additional )) || additional=$(jq -r '.additional // empty' <<<"$cur")
+    _check_fields "edit" "$hostname" "$user" "$key" "$additional"
     local updated; updated=$(jq -n --arg host "$host" --arg hostname "$hostname" --arg user "$user" \
         --arg port "$port" --arg key "$key" --arg additional "$additional" \
         '{host:$host,hostname:$hostname,user:$user,port:$port,key:$key,additional:$additional}')

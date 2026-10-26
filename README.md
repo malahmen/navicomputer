@@ -45,6 +45,13 @@ is left as is. A few rules keep that rewrite safe:
   file the link points to is updated, and the link stays.
 - **Quoting.** A key path with a space is written double-quoted, the only form
   ssh accepts for it.
+- **ssh reads it before it is installed.** Every rewrite is checked with
+  `ssh -F <new file> -G <alias>` for each profile before it replaces the
+  config: one bad line makes ssh reject the whole file, every host on the
+  machine. If ssh refuses it, nothing is written and no backup is taken or
+  pruned, and ssh's own complaint is shown. `HostName` and `User` must be one
+  word (no whitespace), and `--additional` may not hold a `Host` or `Match`
+  line, which would start a new block.
 - **Windows line endings** (CRLF) are refused before anything is written:
   convert the file first.
 - **Marker check.** If the markers are inconsistent (a `BEGIN` without an `END`,
@@ -177,6 +184,7 @@ copy, which is how a fix is checked for actually fixing something.
 | `test-import.sh` | what `import` carries over, and which file it reads to find out |
 | `test-remove-unmanaged.sh` | `--remove-original`: what is deleted, and everything that has to survive it |
 | `test-use.sh` | `core.sshCommand` — asserted on the argument vector a shell would split it into, not on the string |
+| `test-field-validation.sh` | a value ssh cannot read is refused with the config and its backups untouched (item 181) |
 
 ## Options reference
 
@@ -202,8 +210,8 @@ copy, which is how a fix is checked for actually fixing something.
 
 - All output/status goes to **stderr**; data (`list --json`, `view --json`, the
   generated pubkey path from `add`) goes to **stdout**, so it composes in scripts.
-- `--name` must not contain whitespace and `--port` must be a number in
-  `1..65535`; both are rejected with a clear error.
+- `--name`, `--hostname` and `--user` must not contain whitespace and `--port`
+  must be a number in `1..65535`; all are rejected with a clear error.
 - Never elevates privileges; only reads/writes under `~/.ssh` (the config, its
   `.bak` copies, and generated keys). `SSH_DIR=<dir>` moves all of that
   somewhere else — the suites use it, and it is how you can try a change
