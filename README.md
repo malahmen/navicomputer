@@ -52,6 +52,8 @@ is left as is. A few rules keep that rewrite safe:
   pruned, and ssh's own complaint is shown. `HostName` and `User` must be one
   word (no whitespace), and `--additional` may not hold a `Host` or `Match`
   line, which would start a new block.
+- **A symlink into a read-only tree** (home-manager's `/nix/store`) is refused
+  with that reason, before the backup: change the config at its source.
 - **Windows line endings** (CRLF) are refused before anything is written:
   convert the file first.
 - **Marker check.** If the markers are inconsistent (a `BEGIN` without an `END`,
@@ -199,6 +201,7 @@ copy, which is how a fix is checked for actually fixing something.
 | `test-import.sh` | what `import` carries over, and which file it reads to find out |
 | `test-remove-unmanaged.sh` | `--remove-original`: what is deleted, and everything that has to survive it |
 | `test-use.sh` | `core.sshCommand` — asserted on the argument vector a shell would split it into, not on the string |
+| `test-config-edits.sh` | Kamino items 122-125 and 199: `Include` in a block, quoted key paths, backups and their prune, symlinked configs, the lock |
 | `test-delete-keys.sh` | `remove --delete-keys`: never a key anything else uses, only generated ones without `--force` (item 177) |
 | `test-field-validation.sh` | a value ssh cannot read is refused with the config and its backups untouched (item 181) |
 

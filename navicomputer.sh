@@ -130,7 +130,18 @@ _config_real() {
     fi
 }
 # A temp file in the same directory as the real config, so the mv is atomic.
-_config_tmp() { mktemp "$(dirname "$(_config_real)")/.config.XXXXXX"; }
+# Called before the backup, so a directory that cannot be written stops the
+# command with nothing done. A config linked into a read-only tree (home-
+# manager's /nix/store) failed here with a bare mktemp error, after the backup
+# (Kamino item 199).
+_config_tmp() {
+    local real dir; real=$(_config_real); dir=$(dirname "$real")
+    mktemp "$dir/.config.XXXXXX" 2>/dev/null && return 0
+    if [[ "$real" != "$SSH_CONFIG" ]]; then
+        error_exit "${SSH_CONFIG} is a symlink to ${real}, and ${dir} is not writable (read-only, like a /nix/store path managed by home-manager). Nothing was changed: edit the config at its source, or replace the link with a regular file."
+    fi
+    error_exit "Cannot write a temporary file in ${dir} (is it writable?). Nothing was changed."
+}
 
 # Atomically replace the config with $1 (same filesystem, mode 600).
 _install_config() { chmod 600 "$1"; mv -f "$1" "$(_config_real)"; }
@@ -253,6 +264,16 @@ _check_fields() {
 _host_in_config() {
     [[ -f "$SSH_CONFIG" ]] || return 1
     awk 'tolower($1)=="host" { for(i=2;i<=NF;i++) print $i }' "$SSH_CONFIG" | grep -qx "$1"
+}
+
+# _unmanaged_has ALIAS - does a Host line outside the managed section name
+# ALIAS (in any position, as _remove_unmanaged_host matches)?
+_unmanaged_has() {
+    [[ -f "$SSH_CONFIG" ]] || return 1
+    awk -v host="$1" -v b="$BEGIN_MARK" -v e="$END_MARK" '
+        $0==b { m=1; next } $0==e { m=0; next }
+        !m && tolower($1)=="host" { for (i=2; i<=NF; i++) if ($i==host) { found=1; exit } }
+        END { exit !found }' "$SSH_CONFIG"
 }
 
 # Remove a Host block outside the managed section.
@@ -718,10 +739,14 @@ nc_import() {
     save_profiles "$profiles"; info "$imported profile(s) now managed."
     if (( remove_orig )); then
         for alias in "${names[@]}"; do
-            _remove_unmanaged_host "$alias"
             # Said only when it is true: the line was printed whether or not
-            # the block went (Kamino item 125).
-            if nc_unmanaged | grep -qxF -- "$alias"; then warn "Unmanaged entry NOT removed: $alias (still in ${SSH_CONFIG})"
+            # the block went (Kamino item 125) - and for an alias that had no
+            # block to remove at all (item 199). Checked with the matching the
+            # removal uses, every name on the Host line: nc_unmanaged lists the
+            # first one only, so `Host prod web` read as gone for web.
+            if ! _unmanaged_has "$alias"; then info "No unmanaged entry for '$alias'; nothing removed."; continue; fi
+            _remove_unmanaged_host "$alias"
+            if _unmanaged_has "$alias"; then warn "Unmanaged entry NOT removed: $alias (still in ${SSH_CONFIG})"
             else info "Unmanaged entry removed: $alias"; fi
         done
     fi
