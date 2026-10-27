@@ -91,8 +91,10 @@ check "removing it twice, exit 1" test "$RC" -eq 1
 
 echo
 echo "== --delete-keys only deletes the profile's own key =="
+# --force: id_gh is not a name `add --gen-key` would have made, which
+# test-delete-keys.sh covers along with every other refusal (Kamino item 177).
 : > "$SSH_DIR/id_gh"; : > "$SSH_DIR/id_gh.pub"; : > "$SSH_DIR/id_keep"
-run remove --name gh --delete-keys
+run remove --name gh --delete-keys --force
 check "remove exits 0"        test "$RC" -eq 0
 check "the key was deleted"   test ! -e "$SSH_DIR/id_gh"
 check "the pubkey too"        test ! -e "$SSH_DIR/id_gh.pub"
